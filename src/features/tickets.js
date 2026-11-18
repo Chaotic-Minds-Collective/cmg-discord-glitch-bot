@@ -20,17 +20,35 @@ async function archiveTicket(channel, { ownerId, actorId, reason = 'Closed throu
   return withTicketLock(`close:${channel.id}`, async () => {
     const current = typeof channel.fetch === 'function' ? await channel.fetch(true) : channel;
     if (String(current.name).startsWith('closed-')) return { alreadyClosed: true };
+    const topic = String(current.topic || '');
+    const checkpointMarker = '\nticket-closure:';
+    const checkpointIndex = topic.lastIndexOf(checkpointMarker);
+    if (checkpointIndex !== -1) {
+      const checkpoint = JSON.parse(topic.slice(checkpointIndex + checkpointMarker.length));
+      if (!/^\d{17,20}$/.test(String(checkpoint.ownerId))
+        || !/^\d{17,20}$/.test(String(checkpoint.auditMessageId))
+        || typeof checkpoint.closedName !== 'string' || !checkpoint.closedName.startsWith('closed-')
+        || checkpoint.closedName.length > 100) throw new Error('Invalid ticket closure checkpoint.');
+      await current.setName(checkpoint.closedName, 'Preserve closed ticket history');
+      return { alreadyClosed: false };
+    }
     if (!/^\d{17,20}$/.test(String(ownerId))) throw new Error('A valid ticket owner is required before archiving.');
-    if (!current.permissionOverwrites?.edit || !current.send || !current.setName) throw new Error('This channel cannot be safely archived.');
+    if (!current.permissionOverwrites?.edit || !current.send || !current.setName || !current.setTopic) throw new Error('This channel cannot be safely archived.');
+    const checkpoint = { ownerId, auditMessageId: '0'.repeat(20), closedName: `closed-${current.name}`.slice(0, 100) };
+    if (`${topic}${checkpointMarker}${JSON.stringify(checkpoint)}`.length > 1024) {
+      throw new Error('There is no room for a ticket closure checkpoint.');
+    }
     await current.permissionOverwrites.edit(ownerId, {
       ViewChannel: false, SendMessages: false, SendMessagesInThreads: false,
       CreatePublicThreads: false, CreatePrivateThreads: false, AddReactions: false,
     }, 'Archive a closed support ticket for staff');
-    await current.send({
+    const audit = await current.send({
       content: `Ticket archived by user ${String(actorId)} at ${new Date().toISOString()}. Reason: ${String(reason).slice(0, 500)}. Support history is retained for staff.`,
       allowedMentions: { parse: [] },
     });
-    await current.setName(`closed-${current.name}`.slice(0, 100), 'Preserve closed ticket history');
+    checkpoint.auditMessageId = audit.id;
+    await current.setTopic(`${topic}${checkpointMarker}${JSON.stringify(checkpoint)}`, 'Checkpoint ticket closure');
+    await current.setName(checkpoint.closedName, 'Preserve closed ticket history');
     return { alreadyClosed: false };
   });
 }
