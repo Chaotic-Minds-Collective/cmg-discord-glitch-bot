@@ -1,7 +1,7 @@
 const {
   ChannelType, PermissionFlagsBits, MessageFlags, EmbedBuilder,
   ActionRowBuilder, ButtonBuilder, ButtonStyle, ModalBuilder,
-  TextInputBuilder, TextInputStyle,
+  TextInputBuilder, TextInputStyle, OverwriteType,
 } = require('discord.js');
 const config = require('../config');
 const { canCloseTicket, replyEphemeral, ticketOwnerId } = require('../security/permissions');
@@ -53,14 +53,23 @@ function buildTicketOverwrites(guild, userId, botUserId) {
 
 async function findRecentMessageByMarker(channel, marker) {
   if (!channel?.messages?.fetch) throw new Error('Message history access is required for idempotent ticket auditing.');
+  const botUserId = channel.client?.user?.id;
+  if (!botUserId) throw new Error('Bot identity is required for idempotent ticket auditing.');
   const recent = await channel.messages.fetch({ limit: 100 });
   const messages = recent?.values ? Array.from(recent.values()) : Array.isArray(recent) ? recent : [];
-  return messages.find((message) => String(message.content || '').includes(marker)) || null;
+  return messages.find((message) => message.author?.id === botUserId
+    && String(message.content || '').includes(marker)) || null;
 }
 
 async function fetchMessage(channel, messageId) {
   if (!messageId || !channel?.messages?.fetch) return null;
-  try { return await channel.messages.fetch(messageId); } catch { return null; }
+  try {
+    return await channel.messages.fetch(messageId);
+  } catch (error) {
+    const code = Number(error?.code ?? error?.rawError?.code);
+    if (code === 10008) return null;
+    throw error;
+  }
 }
 
 async function getModLogChannel(guild) {
@@ -77,6 +86,13 @@ async function writeCheckpoint(channel, baseTopic, checkpoint) {
   const nextTopic = `${baseTopic}${CHECKPOINT_MARKER}${JSON.stringify(checkpoint)}`;
   if (nextTopic.length > 1024) throw new Error('There is no room for a ticket closure checkpoint.');
   await channel.setTopic(nextTopic, 'Checkpoint ticket closure');
+}
+
+function assertCheckpointCapacity(baseTopic, checkpoint) {
+  const maximumId = '9'.repeat(20);
+  const maximumCheckpoint = { ...checkpoint, auditMessageId: maximumId, modLogMessageId: maximumId };
+  const maximumTopic = `${baseTopic}${CHECKPOINT_MARKER}${JSON.stringify(maximumCheckpoint)}`;
+  if (maximumTopic.length > 1024) throw new Error('There is no room for both ticket closure audit IDs.');
 }
 
 function recoverLegacyClosureMetadata(checkpoint, auditMessage, actorId, reason) {
@@ -145,13 +161,14 @@ async function archiveTicket(channel, { ownerId, actorId, reason = 'Closed throu
         modLogMessageId: null,
         closedName: `closed-${current.name}`.slice(0, 100),
       };
+      assertCheckpointCapacity(baseTopic, checkpoint);
       await writeCheckpoint(current, baseTopic, checkpoint);
     }
 
     await current.permissionOverwrites.edit(ownerId, {
       ViewChannel: false, SendMessages: false, SendMessagesInThreads: false,
       CreatePublicThreads: false, CreatePrivateThreads: false, AddReactions: false,
-    }, 'Archive a closed support ticket for staff');
+    }, { type: OverwriteType.Member, reason: 'Archive a closed support ticket for staff' });
 
     const ticketMarker = `ticket-archive:${current.id}`;
     let ticketAudit = await fetchMessage(current, checkpoint.auditMessageId);
@@ -206,25 +223,50 @@ async function rollbackTicketChannel(channel, ownerId, setupError) {
     return { deleted: true, orphaned: false };
   } catch (deleteError) {
     const cleanup = [];
-    if (channel.permissionOverwrites?.edit) cleanup.push(channel.permissionOverwrites.edit(ownerId, {
-      ViewChannel: false, SendMessages: false, ReadMessageHistory: false,
-    }, 'Hide incomplete ticket after setup failure'));
-    if (channel.setTopic) cleanup.push(channel.setTopic(`ticket-orphaned:${ownerId}`, 'Mark incomplete ticket for staff cleanup'));
-    if (channel.setName) cleanup.push(channel.setName(`orphan-${channel.name}`.slice(0, 100), 'Mark incomplete ticket for staff cleanup'));
-    await Promise.allSettled(cleanup);
+    if (channel.permissionOverwrites?.edit) cleanup.push({
+      name: 'owner access removal',
+      run: () => channel.permissionOverwrites.edit(ownerId, {
+        ViewChannel: false, SendMessages: false, ReadMessageHistory: false,
+      }, { type: OverwriteType.Member, reason: 'Hide incomplete ticket after setup failure' }),
+    });
+    if (channel.setTopic) cleanup.push({
+      name: 'orphan topic marking',
+      run: () => channel.setTopic(`ticket-orphaned:${ownerId}`, 'Mark incomplete ticket for staff cleanup'),
+    });
+    if (channel.setName) cleanup.push({
+      name: 'orphan channel rename',
+      run: () => channel.setName(`orphan-${channel.name}`.slice(0, 100), 'Mark incomplete ticket for staff cleanup'),
+    });
+    const settled = await Promise.allSettled(cleanup.map(({ run }) => Promise.resolve().then(run)));
+    const cleanupStatus = new Map(cleanup.map((operation, index) => [
+      operation.name,
+      settled[index].status === 'fulfilled' ? 'succeeded'
+        : `failed: ${String(settled[index].reason?.message || settled[index].reason)}`,
+    ]));
+    const statusFor = (name) => cleanupStatus.get(name) || 'not attempted (method unavailable)';
+    const accessIndex = cleanup.findIndex((operation) => operation.name === 'owner access removal');
+    const topicIndex = cleanup.findIndex((operation) => operation.name === 'orphan topic marking');
+    const renameIndex = cleanup.findIndex((operation) => operation.name === 'orphan channel rename');
+    const accessRemoved = accessIndex !== -1 && settled[accessIndex].status === 'fulfilled';
+    const topicMarked = topicIndex !== -1 && settled[topicIndex].status === 'fulfilled';
+    const channelRenamed = renameIndex !== -1 && settled[renameIndex].status === 'fulfilled';
+    const orphaned = topicMarked && channelRenamed;
+    const cleanupErrors = cleanup.map((operation, index) => settled[index].status === 'rejected'
+      ? `${operation.name}: ${String(settled[index].reason?.message || settled[index].reason)}`
+      : null).filter(Boolean);
     try {
       const modLog = await getModLogChannel(channel.guild);
       const marker = `ticket-setup-failed:${channel.id}`;
       const existing = await findRecentMessageByMarker(modLog, marker);
       if (!existing) await modLog.send({
-        content: `**Ticket setup cleanup failed**\nChannel: ${channel.name} (${channel.id})\nOwner: ${ownerId}\nThe incomplete channel was marked orphaned for staff cleanup. Setup error: ${String(setupError?.code || 'UNKNOWN')}. Cleanup error: ${String(deleteError?.code || 'UNKNOWN')}. ${marker}`,
+        content: `**Ticket setup cleanup failed**\nChannel: ${channel.name} (${channel.id})\nOwner: ${ownerId}\nOwner access removal: ${statusFor('owner access removal')}. Orphan topic marking: ${statusFor('orphan topic marking')}. Orphan channel rename: ${statusFor('orphan channel rename')}. Setup error: ${String(setupError?.code || 'UNKNOWN')}. Deletion error: ${String(deleteError?.code || 'UNKNOWN')}. Cleanup errors: ${cleanupErrors.join('; ') || 'none'}. ${marker}`,
         allowedMentions: { parse: [] },
       });
     } catch (logError) {
       console.error('Unable to record orphaned ticket cleanup in mod-log:', logError);
     }
-    console.error('Unable to delete incomplete ticket channel; marked for staff cleanup:', deleteError);
-    return { deleted: false, orphaned: true };
+    console.error('Unable to delete incomplete ticket channel; cleanup results:', { deleteError, cleanupErrors });
+    return { deleted: false, orphaned, accessRemoved };
   }
 }
 
