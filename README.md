@@ -8,6 +8,13 @@ The member path is welcome → rules acceptance → verification → game select
 
 See [the onboarding setup guide](docs/ONBOARDING_SETUP.md) for the required Discord role, environment values, role hierarchy, and staff panel commands.
 
+## Ticket lifecycle
+
+- `CHANNEL_TICKETS` must identify the ticket category, and `CHANNEL_MOD_LOG` must identify a staff-only text channel. The bot needs `ViewChannel`, `ReadMessageHistory`, and `SendMessages` in the mod-log channel.
+- The bot's guild role needs `ManageChannels` and `ManageRoles`; each new ticket channel also grants the bot explicit `ViewChannel`, `SendMessages`, `ReadMessageHistory`, and `EmbedLinks` access.
+- Ticket ownership is recorded in channel topic metadata. Open-ticket recovery scans guild channels and filters to the configured category, so state can be reconstructed after a bot restart. The duplicate-open lock is process-local; run one bot instance unless a shared lock store is added.
+- Closing a ticket archives it by removing the owner's access and renaming the channel to `closed-*`. The channel is retained, not deleted, so its full history remains available to staff; closure details are also checkpointed and written to the staff mod-log. If a future retention policy deletes archived channels, transcript export must be implemented before deletion.
+
 ## Chaotic Gaming Core integration
 
 Glitch remains an independent Discord application. When configured, it checks Core API health and reports configured game-server heartbeats using a dedicated service credential.
