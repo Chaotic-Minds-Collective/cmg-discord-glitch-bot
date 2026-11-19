@@ -24,6 +24,7 @@ function load() {
   const module = { exports: {} };
   const discord = {
     ChannelType: { GuildText: 'GUILD_TEXT' },
+    OverwriteType: { Member: 1 },
     PermissionFlagsBits: {
       ViewChannel: 'VIEW_CHANNEL', SendMessages: 'SEND_MESSAGES', ReadMessageHistory: 'READ_HISTORY',
       AttachFiles: 'ATTACH_FILES', EmbedLinks: 'EMBED_LINKS', SendMessagesInThreads: 'SEND_THREADS',
@@ -49,9 +50,10 @@ function environment(options = {}) {
   const calls = [];
   const ticketMessages = [];
   const modLogMessages = [];
-  const makeMessage = (id, payload) => ({ id, content: String(payload?.content || '') });
+  const makeMessage = (id, payload) => ({ id, content: String(payload?.content || ''), author: { id: BOT_ID } });
   const modLog = {
     id: 'mod-log',
+    client: { user: { id: BOT_ID } },
     guildId: 'guild',
     send: async (payload) => {
       calls.push(['modlog-send', payload]);
@@ -80,11 +82,12 @@ function environment(options = {}) {
     type: 'GUILD_TEXT',
     parentId: 'ticket-category',
     guildId: 'guild',
+    client: { user: { id: BOT_ID } },
     guild,
     fetch: async () => c,
     permissionOverwrites: {
-      edit: async (id, flags) => {
-        calls.push(['permissions', id, flags]);
+      edit: async (id, flags, overwriteOptions) => {
+        calls.push(['permissions', id, flags, overwriteOptions]);
         if (options.failPermissions) throw new Error('permission failure');
       },
     },
@@ -124,13 +127,29 @@ test('overlapping opens for the same user serialize and create only once', async
   const { withTicketLock } = load();
   let unblock;
   const gate = new Promise((resolve) => { unblock = resolve; });
-  let created = false;
+  let firstEntered = false;
+  let firstReleased = false;
+  let secondEntered = false;
   let count = 0;
-  const first = withTicketLock('same-user', async () => { await gate; if (!created) { created = true; count++; } });
-  const second = withTicketLock('same-user', async () => { if (!created) { created = true; count++; } });
+  const first = withTicketLock('same-user', async () => {
+    firstEntered = true;
+    await gate;
+    firstReleased = true;
+    count++;
+  });
+  const second = withTicketLock('same-user', async () => {
+    secondEntered = true;
+    assert.equal(firstReleased, true);
+    count++;
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(firstEntered, true);
+  assert.equal(secondEntered, false);
   unblock();
   await Promise.all([first, second]);
-  assert.equal(count, 1);
+  assert.equal(secondEntered, true);
+  assert.equal(count, 2);
 });
 
 test('a failed operation releases its guard for a retry', async () => {
@@ -193,11 +212,12 @@ test('failed deletion marks the incomplete channel orphaned and records it in mo
   const { createTicketChannel } = load();
   const env = environment();
   let options;
+  let rollbackOverwriteOptions;
   const channel = {
     id: 'orphan-channel-id',
     name: 'ticket-member-1234',
     guild: env.guild,
-    permissionOverwrites: { edit: async () => {} },
+    permissionOverwrites: { edit: async (id, flags, overwriteOptions) => { rollbackOverwriteOptions = overwriteOptions; } },
     send: async () => { throw new Error('initial message failure'); },
     delete: async () => { throw new Error('delete failure'); },
     setTopic: async (topic) => { channel.topic = topic; },
@@ -217,6 +237,34 @@ test('failed deletion marks the incomplete channel orphaned and records it in mo
   assert.equal(channel.topic, `ticket-orphaned:${OWNER_ID}`);
   assert.ok(env.modLogMessages.some((message) => message.content.includes('ticket-setup-failed:orphan-channel-id')));
   assert.ok(options.permissionOverwrites.some((overwrite) => overwrite.id === BOT_ID));
+  assert.equal(rollbackOverwriteOptions.type, 1);
+  assert.equal(rollbackOverwriteOptions.reason, 'Hide incomplete ticket after setup failure');
+});
+
+test('failed owner access cleanup is reported without claiming access was removed', async () => {
+  const { createTicketChannel } = load();
+  const env = environment({ failPermissions: true });
+  const channel = {
+    id: 'partial-cleanup-channel',
+    name: 'ticket-member-1234',
+    guild: env.guild,
+    permissionOverwrites: env.c.permissionOverwrites,
+    send: async () => { throw new Error('opening failure'); },
+    delete: async () => { throw new Error('delete failure'); },
+    setTopic: async (topic) => { channel.topic = topic; },
+    setName: async (name) => { channel.name = name; },
+  };
+  env.guild.channels.create = async () => channel;
+  await assert.rejects(createTicketChannel({
+    guild: env.guild,
+    user: { id: OWNER_ID, username: 'member' },
+    botUserId: BOT_ID,
+    openingPayload: {},
+  }), /opening failure/);
+  assert.match(env.modLogMessages[0].content, /Owner access removal: failed: permission failure/);
+  assert.match(env.modLogMessages[0].content, /Orphan topic marking: succeeded/);
+  assert.match(env.modLogMessages[0].content, /Orphan channel rename: succeeded/);
+  assert.match(env.modLogMessages[0].content, /Cleanup errors: owner access removal: permission failure/);
 });
 
 test('archive restricts the owner, records closure in staff mod-log, and preserves the channel', async () => {
@@ -225,7 +273,8 @@ test('archive restricts the owner, records closure in staff mod-log, and preserv
   const result = await archiveTicket(env.c, meta);
   assert.equal(result.alreadyClosed, false);
   assert.equal(env.calls.some(([kind]) => kind === 'DELETE'), false);
-  assert.ok(env.calls.some(([kind, id, flags]) => kind === 'permissions' && id === OWNER_ID && flags.ViewChannel === false));
+  assert.ok(env.calls.some(([kind, id, flags, options]) => kind === 'permissions' && id === OWNER_ID && flags.ViewChannel === false
+    && options.type === 1 && options.reason === 'Archive a closed support ticket for staff'));
   assert.ok(env.calls.some(([kind, payload]) => kind === 'ticket-send' && payload.content.includes(ACTOR_ID)));
   assert.equal(env.modLogMessages.length, 1);
   assert.match(env.modLogMessages[0].content, new RegExp(env.c.id));
@@ -238,6 +287,20 @@ test('archive restricts the owner, records closure in staff mod-log, and preserv
   assert.equal(checkpoint.ownerId, OWNER_ID);
   assert.equal(checkpoint.modLogMessageId, MODLOG_ID);
   assert.equal(checkpoint.auditMessageId, TICKET_AUDIT_ID);
+});
+
+test('owner-authored archive marker is ignored and a bot-authored audit is written', async () => {
+  const { archiveTicket } = load();
+  const env = environment();
+  env.ticketMessages.push({
+    id: 'owner-forged-audit',
+    content: 'Please archive this ticket ticket-archive:' + env.c.id,
+    author: { id: OWNER_ID },
+  });
+  await archiveTicket(env.c, meta);
+  assert.equal(env.ticketMessages.length, 2);
+  assert.equal(env.ticketMessages[1].author.id, BOT_ID);
+  assert.equal(env.ticketMessages[1].content.includes('ticket-archive:' + env.c.id), true);
 });
 
 test('repeated close is idempotent and does not duplicate audit or permission changes', async () => {
@@ -301,6 +364,24 @@ test('retry after rename failure reuses persisted ticket and mod-log audit recor
   assert.equal(env.calls.length, count);
 });
 
+test('transient saved mod-log ID lookup failure propagates without sending a duplicate', async () => {
+  const env = environment({ failRename: true });
+  await assert.rejects(load().archiveTicket(env.c, meta), /rename failure/);
+  const originalFetch = env.modLog.messages.fetch;
+  env.options.failRename = false;
+  env.modLog.messages.fetch = async (query) => {
+    if (query === MODLOG_ID) throw new Error('temporary Discord API failure');
+    return originalFetch(query);
+  };
+  await assert.rejects(load().archiveTicket(env.c, meta), /temporary Discord API failure/);
+  assert.equal(env.ticketMessages.length, 1);
+  assert.equal(env.modLogMessages.length, 1);
+  env.modLog.messages.fetch = originalFetch;
+  await load().archiveTicket(env.c, meta);
+  assert.equal(env.ticketMessages.length, 1);
+  assert.equal(env.modLogMessages.length, 1);
+});
+
 test('legacy closure checkpoint is completed using its original audit metadata', async () => {
   const { archiveTicket } = load();
   const env = environment();
@@ -325,6 +406,35 @@ test('wrong owner and non-ticket channel cannot be archived', async () => {
   uncheckpointedClosed.fetch = async () => uncheckpointedClosed;
   await assert.rejects(archiveTicket(uncheckpointedClosed, meta), /missing its closure checkpoint/);
   assert.equal(env.calls.length, 0);
+});
+
+test('a topic that fits the initial checkpoint but not both maximum audit IDs is rejected before side effects', async () => {
+  const { archiveTicket } = load();
+  const env = environment();
+  const initialCheckpoint = {
+    ownerId: OWNER_ID,
+    actorId: ACTOR_ID,
+    closedAt: '2026-11-19T00:00:00.000Z',
+    reason: meta.reason,
+    auditMessageId: null,
+    modLogMessageId: null,
+    closedName: 'closed-ticket-member-1234',
+  };
+  const marker = String.fromCharCode(10) + 'ticket-closure:';
+  const baseLength = 1024 - marker.length - JSON.stringify(initialCheckpoint).length;
+  const ownerPrefix = 'ticket-owner:' + OWNER_ID + ' ';
+  env.c.topic = ownerPrefix + 'x'.repeat(baseLength - ownerPrefix.length);
+  const initiallyValid = env.c.topic + marker + JSON.stringify(initialCheckpoint);
+  assert.equal(initiallyValid.length, 1024);
+  const maximumCheckpoint = {
+    ...initialCheckpoint,
+    auditMessageId: '9'.repeat(20),
+    modLogMessageId: '9'.repeat(20),
+  };
+  assert.ok((env.c.topic + marker + JSON.stringify(maximumCheckpoint)).length > 1024);
+  await assert.rejects(archiveTicket(env.c, meta), /both ticket closure audit IDs/);
+  assert.equal(env.calls.length, 0);
+  assert.equal(env.c.topic, ownerPrefix + 'x'.repeat(baseLength - ownerPrefix.length));
 });
 
 test('a topic without checkpoint capacity fails before any mutations', async () => {
