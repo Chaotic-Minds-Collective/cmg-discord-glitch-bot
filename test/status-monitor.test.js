@@ -15,8 +15,8 @@ function harness(t, initialResults, { coreApiUrl = "https://core.example.test", 
   const paths = [configPath, corePath, monitorPath, queryPath];
   const originals = paths.map((path) => require.cache[path]);
   require.cache[configPath] = { exports: {
-    coreApi: { baseUrl: coreApiUrl, serviceToken },
-    channels: { serverStatus: "status" }, colors: { primary: 1 }, gameServers,
+    coreApi: { baseUrl: coreApiUrl, serviceToken }, channels: { serverStatus: "status" },
+    colors: { primary: 1 }, gameServers,
   } };
   require.cache[corePath] = { exports: { createCoreApiClient: ({ baseUrl }) => baseUrl ? ({
     getServers: async () => {
@@ -68,17 +68,44 @@ test("publishes display changes and suppresses unchanged results", async (t) => 
   assert.match(h.sent[1].description, /Beta/);
 });
 
-test("oversized names, maps and catalogs serialize within Discord limits", async (t) => {
+test("oversized names, maps and catalogs are preserved across bounded messages", async (t) => {
   const h = harness(t, Array.from({ length: 100 }, (_, i) => ({
     ...server, id: String(i), name: "N".repeat(5000), map: "M".repeat(5000), online: i % 2 === 0,
   })));
   await h.start();
-  assert.equal(h.sent.length, 1);
-  assert.ok(h.sent[0].description.length <= 4096);
-  assert.ok(h.sent[0].description.endsWith("..."));
+  assert.ok(h.sent.length > 1);
+  assert.ok(h.sent.every((embed) => embed.description.length <= 4096));
+  const combined = h.sent.map((embed) => embed.description).join("\n");
+  assert.equal(combined.split("\n").length, 100);
+  assert.ok(combined.includes("N".repeat(256)));
+  assert.ok(combined.includes("M".repeat(256)));
+  const firstBatchCount = h.sent.length;
   h.results([{ ...server, name: "Corrected" }]);
   await h.tick();
-  assert.equal(h.sent.length, 2);
+  assert.equal(h.sent.length, firstBatchCount + 1);
+});
+
+test("partial catalog delivery resumes at the failed message without duplicating prior chunks", async (t) => {
+  const h = harness(t, Array.from({ length: 40 }, (_, i) => ({
+    id: String(i), name: `Server-${i}-${"N".repeat(256)}`, online: false, players: 0, maxPlayers: 0, map: "M".repeat(256),
+  })));
+  const originalSend = h.channel.send;
+  let attempts = 0;
+  h.channel.send = async (message) => {
+    attempts++;
+    if (attempts === 2) throw new Error("simulated second-message failure");
+    return originalSend(message);
+  };
+
+  await h.start();
+  assert.equal(h.sent.length, 1);
+  h.channel.send = originalSend;
+  await h.tick();
+
+  assert.ok(h.sent.length > 1);
+  const descriptions = h.sent.map((embed) => embed.description);
+  assert.equal(new Set(descriptions).size, descriptions.length);
+  assert.equal(descriptions.join("\n").split("\n").length, 40);
 });
 
 test("failed first delivery schedules retries and commits state only after success", async (t) => {
@@ -151,7 +178,7 @@ test("Core failure falls back to GameDig results and the recurring cycle recover
   await h.tick();
   assert.deepEqual(h.queries, [gameServer]);
   assert.equal(h.sent.length, 2);
-      assert.ok(h.sent[1].description.includes("Alpha** - ONLINE - 1/10 players"));
+  assert.ok(h.sent[1].description.includes("Alpha** - ONLINE - 1/10 players"));
   await h.tick();
   assert.equal(h.sent.length, 2);
 });
@@ -171,7 +198,7 @@ test("Core catalog is published even when no local GameDig servers are configure
   assert.match(h.sent[0].description, /Alpha.*ONLINE/);
 });
 
- test("URL-only Core configuration publishes the catalog", async (t) => {
+test("URL-only Core configuration publishes the catalog", async (t) => {
   const h = harness(t, [server], { serviceToken: "", gameServers: localServers });
   await h.start();
   assert.equal(h.sent.length, 1);

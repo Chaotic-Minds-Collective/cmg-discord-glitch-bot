@@ -6,6 +6,8 @@ const config = require("../config");
 let coreApiClient;
 let lastCoreWarningAt = 0;
 let lastChangeKey;
+let pendingChangeKey;
+let nextDescriptionIndex = 0;
 
 function getCoreApiClient() {
   const settings = config.coreApi || {};
@@ -25,6 +27,25 @@ function warnCore(error) {
     console.warn("[Core] Server catalog unavailable; using GameDig fallback:", error.code || "REQUEST_FAILED");
     lastCoreWarningAt = Date.now();
   }
+}
+
+function buildDescriptions(results) {
+  const lines = results.map((server) => server.online
+    ? `:large_blue_circle: **${String(server.name).slice(0, 256)}** - ONLINE - ${server.players}/${server.maxPlayers} players${server.map ? ` - ${String(server.map).slice(0, 256)}` : ""}`
+    : `:red_circle: **${String(server.name).slice(0, 256)}** - OFFLINE`);
+  const descriptions = [];
+  let current = "";
+
+  for (const line of lines) {
+    if (current && current.length + 1 + line.length > 4096) {
+      descriptions.push(current);
+      current = line;
+    } else {
+      current = current ? `${current}\n${line}` : line;
+    }
+  }
+  if (current) descriptions.push(current);
+  return descriptions;
 }
 
 async function check(client) {
@@ -52,11 +73,7 @@ async function check(client) {
   const channel = client.channels.cache.get(channelId);
   if (!channel) return;
 
-  const lines = results.map((server) => server.online
-    ? `:large_blue_circle: **${String(server.name).slice(0, 256)}** - ONLINE - ${server.players}/${server.maxPlayers} players${server.map ? ` - ${String(server.map).slice(0, 256)}` : ""}`
-    : `:red_circle: **${String(server.name).slice(0, 256)}** - OFFLINE`);
-  const text = lines.join("\n");
-  const description = text.length > 4096 ? `${text.slice(0, 4093)}...` : text;
+  const descriptions = buildDescriptions(results);
   const changeKey = JSON.stringify(results.map((server) => [
     server.id ?? null,
     server.name,
@@ -67,13 +84,24 @@ async function check(client) {
   ]));
   if (changeKey === lastChangeKey) return;
 
-  const embed = new EmbedBuilder()
-    .setColor(config.colors.primary)
-    .setTitle("SERVER STATUS UPDATE")
-    .setDescription(description)
-    .setTimestamp();
-  await channel.send({ embeds: [embed] });
+  if (pendingChangeKey !== changeKey) {
+    pendingChangeKey = changeKey;
+    nextDescriptionIndex = 0;
+  }
+
+  while (nextDescriptionIndex < descriptions.length) {
+    const embed = new EmbedBuilder()
+      .setColor(config.colors.primary)
+      .setTitle("SERVER STATUS UPDATE")
+      .setDescription(descriptions[nextDescriptionIndex])
+      .setTimestamp();
+    await channel.send({ embeds: [embed] });
+    nextDescriptionIndex++;
+  }
+
   lastChangeKey = changeKey;
+  pendingChangeKey = undefined;
+  nextDescriptionIndex = 0;
 }
 
 async function reportCoreHeartbeats(results) {
