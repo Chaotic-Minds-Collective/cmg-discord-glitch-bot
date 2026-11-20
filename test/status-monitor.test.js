@@ -131,7 +131,7 @@ test("a conflicting partial catalog is corrected when the last completed catalog
   h.channel.send = originalSend;
   await h.tick();
   assert.equal(h.sent.length, 3);
-  assert.match(h.sent[2].description, /Alpha\\*\\* - ONLINE/);
+  assert.match(h.sent[2].description, /Alpha\*\* - ONLINE/);
 });
 
 test("overlapping status checks are skipped and the next cycle publishes the latest catalog", async (t) => {
