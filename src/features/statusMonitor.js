@@ -82,7 +82,8 @@ async function check(client) {
     server.maxPlayers,
     server.map ?? null,
   ]));
-  if (changeKey === lastChangeKey) return;
+  const conflictingPartialDelivery = pendingChangeKey !== undefined && pendingChangeKey !== changeKey;
+  if (changeKey === lastChangeKey && !conflictingPartialDelivery) return;
 
   if (pendingChangeKey !== changeKey) {
     pendingChangeKey = changeKey;
@@ -135,9 +136,18 @@ async function reportCoreHeartbeats(results) {
 }
 
 async function monitorLoop(client) {
-  const runCheck = () => check(client).catch((error) => {
-    console.error("[Server Status] Monitor cycle failed:", error.message);
-  });
+  let checkInProgress = false;
+  const runCheck = async () => {
+    if (checkInProgress) return;
+    checkInProgress = true;
+    try {
+      await check(client);
+    } catch (error) {
+      console.error("[Server Status] Monitor cycle failed:", error.message);
+    } finally {
+      checkInProgress = false;
+    }
+  };
   await runCheck();
   setInterval(runCheck, 2 * 60 * 1000);
 }

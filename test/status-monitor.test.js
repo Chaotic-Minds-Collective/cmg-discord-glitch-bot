@@ -108,6 +108,65 @@ test("partial catalog delivery resumes at the failed message without duplicating
   assert.equal(descriptions.join("\n").split("\n").length, 40);
 });
 
+test("a conflicting partial catalog is corrected when the last completed catalog returns", async (t) => {
+  const catalogA = [server];
+  const catalogB = Array.from({ length: 20 }, (_, i) => ({
+    id: `b-${i}`, name: `B-${i}-${"N".repeat(256)}`, online: false, players: 0, maxPlayers: 0, map: "M".repeat(256),
+  }));
+  const h = harness(t, catalogA);
+  const originalSend = h.channel.send;
+  let attempts = 0;
+  h.channel.send = async (message) => {
+    attempts++;
+    if (attempts === 3) throw new Error("simulated second catalog chunk failure");
+    return originalSend(message);
+  };
+
+  await h.start();
+  h.results(catalogB);
+  await h.tick();
+  assert.equal(h.sent.length, 2);
+
+  h.results(catalogA);
+  h.channel.send = originalSend;
+  await h.tick();
+  assert.equal(h.sent.length, 3);
+  assert.match(h.sent[2].description, /Alpha\\*\\* - ONLINE/);
+});
+
+test("overlapping status checks are skipped and the next cycle publishes the latest catalog", async (t) => {
+  const h = harness(t, [server]);
+  await h.start();
+  const originalSend = h.channel.send;
+  let releaseFirst;
+  let startedResolve;
+  const started = new Promise((resolve) => { startedResolve = resolve; });
+  let sends = 0;
+  h.channel.send = async (message) => {
+    sends++;
+    if (sends === 1) {
+      await new Promise((resolve) => {
+        releaseFirst = resolve;
+        startedResolve();
+      });
+    }
+    return originalSend(message);
+  };
+
+  h.results([{ ...server, name: "Beta" }]);
+  const firstTick = h.tick();
+  await started;
+  h.results([{ ...server, name: "Gamma" }]);
+  await h.tick();
+  assert.equal(sends, 1);
+
+  releaseFirst();
+  await firstTick;
+  await h.tick();
+  assert.equal(sends, 2);
+  assert.match(h.sent[2].description, /Gamma/);
+});
+
 test("failed first delivery schedules retries and commits state only after success", async (t) => {
   const h = harness(t, [server]);
   const send = h.channel.send;
